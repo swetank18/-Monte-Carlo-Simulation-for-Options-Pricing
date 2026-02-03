@@ -35,6 +35,19 @@ class MCSettings:
     full_paths: bool = False  # set True for path-dependent options
 
 
+@dataclass(frozen=True)
+class HestonParams:
+    s0: float
+    k: float
+    r: float
+    v0: float
+    kappa: float
+    theta: float
+    xi: float
+    rho: float
+    t: float
+
+
 # =========================
 # Black-Scholes Analytics
 # =========================
@@ -223,6 +236,65 @@ def antithetic_monte_carlo_price(
     return price, std_error, ci, var_reduction
 
 
+def compare_estimators_shared_paths(
+    params: OptionParams,
+    settings: MCSettings,
+    call: bool = True,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Compare naive MC, antithetic variates, and control variates using identical paths.
+    Returns tuples of (price, std_error, variance_reduction) for each estimator.
+    """
+    s0, k, r, sigma, t = params.s0, params.k, params.r, params.sigma, params.t
+    rng = np.random.default_rng(settings.seed) if settings.seed is not None else np.random.default_rng()
+
+    n = settings.n_paths
+    half = n // 2
+    z = rng.standard_normal(size=half)
+    z_full = np.concatenate([z, -z])
+    if n % 2 == 1:
+        z_full = np.concatenate([z_full, rng.standard_normal(size=1)])
+
+    drift = (r - 0.5 * sigma ** 2) * t
+    diffusion = sigma * math.sqrt(t) * z_full
+    s_t = s0 * np.exp(drift + diffusion)
+
+    if call:
+        payoffs = np.maximum(s_t - k, 0.0)
+    else:
+        payoffs = np.maximum(k - s_t, 0.0)
+
+    # Naive MC
+    y = np.exp(-r * t) * payoffs
+    naive_price = float(np.mean(y))
+    naive_se = float(np.std(y, ddof=1) / math.sqrt(y.size))
+
+    # Antithetic variates (pairwise average)
+    pair_count = half
+    pair_avg = 0.5 * (payoffs[:pair_count] + payoffs[pair_count:2 * pair_count])
+    if n % 2 == 1:
+        pair_avg = np.concatenate([pair_avg, payoffs[-1:]])
+    y_anti = np.exp(-r * t) * pair_avg
+    anti_price = float(np.mean(y_anti))
+    anti_se = float(np.std(y_anti, ddof=1) / math.sqrt(y_anti.size))
+    anti_vr = float(np.var(y, ddof=1) / np.var(y_anti, ddof=1)) if np.var(y_anti, ddof=1) > 0 else float("inf")
+
+    # Control variate (Black-Scholes linear control)
+    bs_price = black_scholes_price(s0, k, r, sigma, t, call=call)
+    bs_delta = black_scholes_delta(s0, k, r, sigma, t, call=call)
+    x = bs_price + bs_delta * (np.exp(-r * t) * s_t - s0)
+
+    cov = np.cov(y, x, ddof=1)[0, 1]
+    var_x = np.var(x, ddof=1)
+    b_opt = cov / var_x if var_x > 0 else 0.0
+    y_cv = y - b_opt * (x - bs_price)
+    cv_price = float(np.mean(y_cv))
+    cv_se = float(np.std(y_cv, ddof=1) / math.sqrt(y_cv.size))
+    cv_vr = float(np.var(y, ddof=1) / np.var(y_cv, ddof=1)) if np.var(y_cv, ddof=1) > 0 else float("inf")
+
+    return (naive_price, naive_se, 1.0), (anti_price, anti_se, anti_vr), (cv_price, cv_se, cv_vr)
+
+
 def control_variate_price(
     params: OptionParams,
     settings: MCSettings,
@@ -290,6 +362,125 @@ def monte_carlo_delta_pathwise(
     return delta, std_error, ci
 
 
+def up_and_out_call_price(
+    params: OptionParams,
+    settings: MCSettings,
+    barrier: float,
+) -> Tuple[float, float, Tuple[float, float]]:
+    """
+    Up-and-out European call option priced via Monte Carlo with time-stepping.
+    If the path ever crosses the barrier, the option is knocked out and payoff is zero.
+    This is path-dependent because the barrier depends on the entire trajectory, not just S_T.
+    """
+    s0, k, r, sigma, t = params.s0, params.k, params.r, params.sigma, params.t
+    paths = simulate_gbm_paths(s0, r, sigma, t, settings.n_paths, settings.n_steps, settings.seed)
+    max_s = np.max(paths, axis=1)
+    knocked_out = max_s >= barrier
+    s_t = paths[:, -1]
+    payoffs = np.where(knocked_out, 0.0, np.maximum(s_t - k, 0.0))
+    discounted = np.exp(-r * t) * payoffs
+    price, std_error, ci = mc_stats(discounted, r, t, payoffs)
+    return price, std_error, ci
+
+
+def asian_arithmetic_call_price(
+    params: OptionParams,
+    settings: MCSettings,
+) -> Tuple[float, float, Tuple[float, float]]:
+    """
+    Arithmetic-average Asian call priced via Monte Carlo time-stepping.
+    Uses full-path simulation; Black-Scholes does not apply because the payoff
+    depends on the path-average rather than only S_T.
+    """
+    s0, k, r, sigma, t = params.s0, params.k, params.r, params.sigma, params.t
+    paths = simulate_gbm_paths(s0, r, sigma, t, settings.n_paths, settings.n_steps, settings.seed)
+    avg_price = np.mean(paths, axis=1)
+    payoffs = np.maximum(avg_price - k, 0.0)
+    discounted = np.exp(-r * t) * payoffs
+    price, std_error, ci = mc_stats(discounted, r, t, payoffs)
+    return price, std_error, ci
+
+
+def simulate_heston_paths(
+    params: HestonParams,
+    settings: MCSettings,
+) -> np.ndarray:
+    """
+    Simulate Heston stochastic volatility paths using Euler discretization.
+    Volatility follows mean-reverting square-root process with correlation to stock shocks.
+    """
+    n_paths, n_steps = settings.n_paths, settings.n_steps
+    dt = params.t / n_steps
+    rng = np.random.default_rng(settings.seed) if settings.seed is not None else np.random.default_rng()
+
+    s = np.full(n_paths, params.s0, dtype=float)
+    v = np.full(n_paths, params.v0, dtype=float)
+
+    for _ in range(n_steps):
+        z1 = rng.standard_normal(size=n_paths)
+        z2 = rng.standard_normal(size=n_paths)
+        w2 = params.rho * z1 + math.sqrt(1.0 - params.rho ** 2) * z2
+
+        v = np.maximum(
+            v + params.kappa * (params.theta - v) * dt + params.xi * np.sqrt(np.maximum(v, 0.0)) * math.sqrt(dt) * w2,
+            0.0,
+        )
+        s = s * np.exp((params.r - 0.5 * v) * dt + np.sqrt(np.maximum(v, 0.0)) * math.sqrt(dt) * z1)
+
+    return s
+
+
+def heston_call_price(
+    params: HestonParams,
+    settings: MCSettings,
+) -> Tuple[float, float, Tuple[float, float]]:
+    """
+    Price a European call under Heston stochastic volatility via Monte Carlo.
+    """
+    s_t = simulate_heston_paths(params, settings)
+    payoffs = np.maximum(s_t - params.k, 0.0)
+    discounted = np.exp(-params.r * params.t) * payoffs
+    price, std_error, ci = mc_stats(discounted, params.r, params.t, payoffs)
+    return price, std_error, ci
+
+
+def finite_difference_greeks(
+    params: OptionParams,
+    settings: MCSettings,
+    call: bool = True,
+    bump: float = 0.5,
+) -> Tuple[float, float, float, float]:
+    """
+    Finite-difference Delta/Gamma using common random numbers for variance reduction.
+    Returns (delta, delta_se, gamma, gamma_se).
+    """
+    s0, k, r, sigma, t = params.s0, params.k, params.r, params.sigma, params.t
+    rng = np.random.default_rng(settings.seed) if settings.seed is not None else np.random.default_rng()
+    z = rng.standard_normal(size=settings.n_paths)
+
+    def payoff_with_s0(s0_val: float) -> np.ndarray:
+        drift = (r - 0.5 * sigma ** 2) * t
+        diffusion = sigma * math.sqrt(t) * z
+        s_t = s0_val * np.exp(drift + diffusion)
+        if call:
+            return np.maximum(s_t - k, 0.0)
+        return np.maximum(k - s_t, 0.0)
+
+    pay_up = payoff_with_s0(s0 + bump)
+    pay_dn = payoff_with_s0(s0 - bump)
+    pay_0 = payoff_with_s0(s0)
+
+    disc = math.exp(-r * t)
+    d_i = disc * (pay_up - pay_dn) / (2.0 * bump)
+    g_i = disc * (pay_up - 2.0 * pay_0 + pay_dn) / (bump ** 2)
+
+    delta = float(np.mean(d_i))
+    gamma = float(np.mean(g_i))
+    delta_se = float(np.std(d_i, ddof=1) / math.sqrt(d_i.size))
+    gamma_se = float(np.std(g_i, ddof=1) / math.sqrt(g_i.size))
+    return delta, delta_se, gamma, gamma_se
+
+
 # =========================
 # Main
 # =========================
@@ -328,6 +519,132 @@ def main() -> None:
         )
         print(f"  BS Delta = {bs_delta:.4f}")
         print()
+
+    # Convergence experiment for European call
+    print("Convergence Experiment (Call):")
+    path_counts = [1000, 5000, 10000, 20000, 50000]
+    results = []
+    for n in path_counts:
+        exp_settings = MCSettings(
+            n_paths=n,
+            n_steps=settings.n_steps,
+            seed=settings.seed,
+            full_paths=False,
+        )
+        price, se, ci, _, _ = monte_carlo_price(params, exp_settings, call=True)
+        results.append((n, price, se, ci))
+        print(
+            f"  N={n:6d} | Price={price:.4f} | SE={se:.4f} | 95% CI [{ci[0]:.4f}, {ci[1]:.4f}]"
+        )
+
+    # Convergence summary:
+    # As N increases, the standard error should fall roughly like 1/sqrt(N),
+    # and the confidence interval should tighten around the true price.
+    if results:
+        se_first = results[0][2]
+        se_last = results[-1][2]
+        if se_last > 0:
+            ratio = se_first / se_last
+            print(
+                "Convergence Summary: SE decreased by "
+                f"{ratio:.2f}x from N={results[0][0]} to N={results[-1][0]}, "
+                "consistent with Monte Carlo's 1/sqrt(N) rate."
+            )
+        else:
+            print("Convergence Summary: SE did not decrease as expected (check inputs).")
+
+    print()
+    print("Estimator Comparison (Call, Shared Paths):")
+    naive_stats, anti_stats, cv_stats = compare_estimators_shared_paths(params, settings, call=True)
+    print("  Method       | Price   | SE      | VR")
+    print(f"  Naive MC     | {naive_stats[0]:7.4f} | {naive_stats[1]:7.4f} | {naive_stats[2]:.2f}x")
+    print(f"  Antithetic   | {anti_stats[0]:7.4f} | {anti_stats[1]:7.4f} | {anti_stats[2]:.2f}x")
+    print(f"  Control Var  | {cv_stats[0]:7.4f} | {cv_stats[1]:7.4f} | {cv_stats[2]:.2f}x")
+
+    print()
+    print("Asian Arithmetic-Average Call (Time-Stepping):")
+    asian_settings = MCSettings(
+        n_paths=settings.n_paths,
+        n_steps=settings.n_steps,
+        seed=settings.seed,
+        full_paths=True,
+    )
+    asian_price, asian_se, asian_ci = asian_arithmetic_call_price(params, asian_settings)
+    euro_price, euro_se, euro_ci, _, _ = monte_carlo_price(params, settings, call=True)
+    print(
+        f"  Asian Price = {asian_price:.4f} | 95% CI [{asian_ci[0]:.4f}, {asian_ci[1]:.4f}] | SE={asian_se:.4f}"
+    )
+    print(
+        f"  Euro Price  = {euro_price:.4f} | 95% CI [{euro_ci[0]:.4f}, {euro_ci[1]:.4f}] | SE={euro_se:.4f}"
+    )
+    print(
+        "  Note: Black-Scholes does not apply to arithmetic-average Asian options because the payoff\n"
+        "  depends on the entire path average, not just the terminal price S_T."
+    )
+
+    print()
+    print("Up-and-Out Call (Barrier, Path-Dependent):")
+    barrier = 130.0
+    barrier_settings = MCSettings(
+        n_paths=settings.n_paths,
+        n_steps=settings.n_steps,
+        seed=settings.seed,
+        full_paths=True,
+    )
+    uo_price, uo_se, uo_ci = up_and_out_call_price(params, barrier_settings, barrier=barrier)
+    euro_price, euro_se, euro_ci, _, _ = monte_carlo_price(params, settings, call=True)
+    print(
+        f"  Barrier={barrier:.2f} | Price={uo_price:.4f} | 95% CI [{uo_ci[0]:.4f}, {uo_ci[1]:.4f}] | SE={uo_se:.4f}"
+    )
+    print(
+        f"  Euro Price={euro_price:.4f} | 95% CI [{euro_ci[0]:.4f}, {euro_ci[1]:.4f}] | SE={euro_se:.4f}"
+    )
+    print(
+        "  Note: Barrier options are path-dependent because a single crossing knocks the option out."
+    )
+
+    print()
+    print("Heston Stochastic Volatility (Euler, European Call):")
+    heston_params = HestonParams(
+        s0=100.0,
+        k=100.0,
+        r=0.05,
+        v0=0.04,
+        kappa=2.0,
+        theta=0.04,
+        xi=0.5,
+        rho=-0.7,
+        t=1.0,
+    )
+    heston_price, heston_se, heston_ci = heston_call_price(heston_params, settings)
+    bs_price = black_scholes_price(params.s0, params.k, params.r, params.sigma, params.t, call=True)
+    print(
+        f"  Heston Price = {heston_price:.4f} | 95% CI [{heston_ci[0]:.4f}, {heston_ci[1]:.4f}] | SE={heston_se:.4f}"
+    )
+    print(
+        f"  BS Price     = {bs_price:.4f} (constant volatility benchmark)"
+    )
+    print(
+        "  Note: Heston introduces stochastic volatility and skew, so prices can differ from Black-Scholes."
+    )
+
+    print()
+    print("Greeks Comparison (European Call, Monte Carlo):")
+    fd_delta, fd_delta_se, fd_gamma, fd_gamma_se = finite_difference_greeks(params, settings, call=True, bump=0.5)
+    pw_delta, pw_delta_se, pw_delta_ci = monte_carlo_delta_pathwise(params, settings, call=True)
+    print(
+        f"  Pathwise Delta = {pw_delta:.4f} | SE={pw_delta_se:.4f} | 95% CI [{pw_delta_ci[0]:.4f}, {pw_delta_ci[1]:.4f}]"
+    )
+    print(
+        f"  FD Delta      = {fd_delta:.4f} | SE={fd_delta_se:.4f} | bump=0.5"
+    )
+    print(
+        f"  FD Gamma      = {fd_gamma:.4f} | SE={fd_gamma_se:.4f} | bump=0.5"
+    )
+    print(
+        "  Note: Finite differences introduce bias from the bump size but are broadly applicable.\n"
+        "  Pathwise estimators typically have lower variance when payoff is differentiable."
+    )
 
 
 if __name__ == "__main__":
