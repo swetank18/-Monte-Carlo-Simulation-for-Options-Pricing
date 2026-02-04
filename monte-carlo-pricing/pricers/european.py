@@ -46,7 +46,7 @@ def european_heston_mc_price(
     n_steps: int,
     seed: Optional[int],
 ) -> Tuple[float, float, Tuple[float, float]]:
-    \"\"\"European call price under Heston via Monte Carlo (Euler).\"\"\"
+    """European call price under Heston via Monte Carlo (Euler)."""
     s_t = simulate_heston_terminal(s0, r, v0, kappa, theta, xi, rho, t, n_paths, n_steps, seed)
     payoffs = np.maximum(s_t - k, 0.0)
     return mc_stats_from_payoffs(payoffs, r, t)

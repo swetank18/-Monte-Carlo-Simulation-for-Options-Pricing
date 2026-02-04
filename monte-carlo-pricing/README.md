@@ -1,55 +1,57 @@
 # Monte Carlo Pricing
 
-This project implements Monte Carlo pricing for European, Asian, and barrier options under GBM and Heston models. It includes variance reduction methods, analytical Black-Scholes benchmarks, and small experiments for convergence and estimator comparison.
+## Motivation
+Black?Scholes assumes constant volatility and lognormal returns. Empirically, implied volatility varies with strike and maturity, producing a volatility smile/skew that violates those assumptions. This project uses Monte Carlo simulation to (i) price options that are path-dependent or outside the Black?Scholes analytic scope, and (ii) compare constant-volatility pricing against stochastic-volatility dynamics (Heston) to expose model risk.
 
-## Structure
-- models/
-  - gbm.py: exact GBM simulation (terminal and paths)
-  - heston.py: Heston stochastic volatility (Euler discretization)
-- pricers/
-  - european.py: European option MC pricing and Greeks
-  - asian.py: arithmetic-average Asian call (path-dependent)
-  - barrier.py: up-and-out call (path-dependent)
-- variance_reduction/
-  - antithetic.py: antithetic variates for European options
-  - control_variate.py: Black-Scholes control variate
-- analytics/
-  - black_scholes.py: price and delta
-- experiments/
-  - convergence.py: price vs paths and confidence intervals
-  - comparison.py: naive vs antithetic vs control variate
-- utils/
-  - statistics.py: MC standard error and CI
+## Monte Carlo Methodology
+Under the risk-neutral measure, option prices are discounted expectations of payoffs. For European options under GBM, terminal prices are simulated using the exact solution:
 
-## Risk-Neutral Model
-GBM under the risk-neutral measure:
+S_T = S_0 * exp((r - 0.5*sigma^2) * T + sigma * sqrt(T) * Z),  Z ~ N(0, 1)
 
-S_T = S_0 * exp((r - 0.5*sigma^2) * T + sigma * sqrt(T) * Z)
-
-Option prices are computed as:
-
-Price = E[ exp(-rT) * payoff(S_T) ]
+For path-dependent options (Asian arithmetic-average and up-and-out barrier), full paths are simulated with time-stepping and payoffs computed from the path functional. Standard errors and 95% confidence intervals are reported for all Monte Carlo estimators.
 
 ## Variance Reduction
-- Antithetic variates: pairs each Z with -Z.
-- Control variate: linear Black-Scholes control using BS price and Delta.
+Two variance-reduction techniques are implemented:
+- Antithetic variates: pairs Z with -Z to reduce variance via negative correlation.
+- Control variates: a Black?Scholes linear control using analytic price and Delta, with an optimal control coefficient estimated from the sample.
 
-## Path Dependence
-- Asian arithmetic-average call: depends on the average of the path.
-- Up-and-out barrier call: knocked out if the path crosses a barrier.
-Black-Scholes does not apply to these payoffs because they are not functions of S_T alone.
+## Stochastic Volatility and Model Risk
+Heston stochastic volatility is simulated via Euler discretization. Because volatility is random and correlated with returns, option prices and implied volatilities deviate from the constant-volatility Black?Scholes benchmark. The resulting implied-volatility smile demonstrates model risk: a single sigma cannot explain prices across strikes.
 
-## Heston Model
-The Heston model introduces stochastic variance and is simulated with Euler discretization. Prices can differ from Black-Scholes because volatility is no longer constant.
+## Key Numerical Findings
+Quantitative outputs are written to `results/`:
+- `results/results_summary.csv`: pricing summaries with standard errors and confidence intervals.
+- `results/greeks_summary.csv`: Delta/Gamma comparisons.
+- `results/convergence.csv`: convergence vs path count.
+- `results/heston_smile.csv`: implied volatility smile data.
 
-## Experiments
-Run from the project root:
+The accompanying plots in `results/` visualize variance reduction effectiveness, Monte Carlo convergence, and the Heston smile. See `results/README.md` for the exact column definitions.
+
+## Reproducibility
+From the project root:
 
 ```powershell
-python .\experiments\convergence.py
-python .\experiments\comparison.py
+pip install -r .\requirements.txt
+python .\experiments\run_all.py
+python .\experiments\plot_results.py
 ```
 
-## Requirements
-- Python 3.10+
-- NumPy
+These commands generate the CSV outputs and plots under `results/`.
+
+## Streamlit Dashboard
+Launch the precomputed-results dashboard:
+
+```powershell
+streamlit run .\app.py
+```
+
+The app reads data from `results/` only and does not run simulations.
+
+## Repository Structure
+- models/: GBM and Heston simulators
+- pricers/: European, Asian, and barrier pricers + Greeks
+- variance_reduction/: antithetic and control variate
+- analytics/: Black?Scholes and implied volatility utilities
+- experiments/: batch runners and plot generation
+- utils/: statistical utilities and CSV reporting
+- results/: generated CSVs and plots
