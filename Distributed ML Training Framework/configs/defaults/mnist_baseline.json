@@ -1,0 +1,13 @@
+﻿{
+  "seed": 1234,
+  "batch_size": 64,
+  "epochs": 5,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0,
+  "hidden_dim": 256,
+  "num_workers": 0,
+  "device": "cpu",
+  "data_root": "./data",
+  "log_level": "INFO",
+  "simulate_workers": 1
+}
